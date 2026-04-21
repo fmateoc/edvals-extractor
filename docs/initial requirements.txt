@@ -1,0 +1,13 @@
+Create a hybrid pdf extractor using pdfplumber for table extraction and PyMuPDF for text extraction. 
+The first phase deals with table extraction
+We want to get from pdfplumber, for each page:
+ 1. whether it starts with a table (there is no text, other than perhaps a page header, preceding it).
+ 2, whether it ends with a table (there is no text, other than perhaps a page footer and maybe a page number, after it).
+ 3. an array of tuples containing, for each table on a page, the number of columns, the number of rows, and whether it is overlapping with (is an inner table of) another table. 
+We identify table continuations as the last (outer) table from a page ending with a table, coupled with the first (outer) table from a page starting with a table. The merged table should have the headers (1 row) from the second table removed (if present - they should be identical with the first table's headers). When merging tables, we should also identify continuing rows - if the first row (after headers removal) of the second table has at least two empty (or whitespace only) cells, or if the value from the first cell contains the text "(continued)" or  "(Continued)", then this first row is considered a continuation of the last row from the first table, and their cells are merged with a newline (the cells are multiline).
+To identify page headers and footers for table continuations thusly:
+ 1. Calculate Global Bounds: We'll scan all pages in the document. We will find the absolute minimum top Y-coordinate (min_table_top) across all table bounding boxes, and the absolute maximum bottom Y-coordinate (max_table_bottom) across all table bounding boxes.
+ 2. Apply Header/Footer Exclusion: Any text that is positioned above min_table_top is considered a header and will be ignored. Any text positioned below max_table_bottom is considered a footer and will be ignored.
+ 3. Starts/Ends Check: For a specific page:
+  a. "Starts with a table": Are there any words between min_table_top and the top of the first table on this page? If no, it starts with a table.
+  b. "Ends with a table": Are there any words between the bottom of the last table on this page and max_table_bottom? If no, it ends with a table.
