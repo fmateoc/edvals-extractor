@@ -21,6 +21,42 @@ def calculate_margins(pdf_path):
         
     return min_table_top, max_table_bottom
 
+def is_nested(table_bbox, other_tables):
+    for other in other_tables:
+        if other == table_bbox: continue
+        if (table_bbox[0] >= other[0] and
+            table_bbox[1] >= other[1] and
+            table_bbox[2] <= other[2] and
+            table_bbox[3] <= other[3]):
+            return True
+    return False
+
+def format_nested_cell(page, cell_bbox):
+    try:
+        padded_bbox = (cell_bbox[0]+1, cell_bbox[1]+1, cell_bbox[2]-1, cell_bbox[3]-1)
+        cropped = page.crop(padded_bbox)
+
+        inner_tables = cropped.find_tables()
+        if inner_tables:
+            html_table = "<table>"
+            inner = inner_tables[0]
+            data = inner.extract()
+            for row in data:
+                html_table += "<tr>"
+                for cell in row:
+                    text = str(cell).replace('\n', '<br>') if cell else ""
+                    html_table += f"<td>{text}</td>"
+                html_table += "</tr>"
+            html_table += "</table>"
+            return html_table
+        else:
+            text = cropped.extract_text(layout=True)
+            if not text: return ""
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            return "<br>".join(lines)
+    except:
+        return ""
+
 def extract_table_metadata(pdf_path, min_table_top, max_table_bottom):
     page_metadata = []
     
@@ -37,28 +73,91 @@ def extract_table_metadata(pdf_path, min_table_top, max_table_bottom):
             extracted_tables = []
             
             if tables:
-                for j, t in enumerate(tables):
-                    is_inner = False
-                    for k, other_t in enumerate(tables):
-                        if j == k: continue
-                        if (t.bbox[0] >= other_t.bbox[0] and
-                            t.bbox[1] >= other_t.bbox[1] and
-                            t.bbox[2] <= other_t.bbox[2] and
-                            t.bbox[3] <= other_t.bbox[3]):
-                            is_inner = True
-                            break
-                            
-                    num_rows = len(t.cells)
-                    num_cols = len(t.cells[0]) if num_rows > 0 else 0
-                    table_info.append((num_cols, num_rows, is_inner))
+                outer_tables = []
+                for t in tables:
+                    if not is_nested(t.bbox, [ot.bbox for ot in tables]):
+                        outer_tables.append(t)
+
+                outer_tables = sorted(outer_tables, key=lambda tbl: tbl.bbox[1])
+
+                for outer in outer_tables:
+                    raw_data = outer.extract()
+                    raw_cells = outer.cells
+
+                    merged_data = []
+                    current_row = None
+                    current_bbox_group = None
                     
-                    if not is_inner:
-                        extracted_tables.append(t)
+                    for row_idx, r in enumerate(raw_data):
+                        r = [c if c else "" for c in r]
+                        has_main_text = any(str(c).strip() for c in r[:3])
                         
-                if extracted_tables:
-                    extracted_tables = sorted(extracted_tables, key=lambda tbl: tbl.bbox[1])
-                    first_outer_table = extracted_tables[0]
-                    last_outer_table = extracted_tables[-1]
+                        if has_main_text:
+                            if current_row:
+                                merged_data.append((current_row, current_bbox_group))
+                            current_row = r
+                            # cells is a list of tuples or Nones. We need a list of actual tuples to track bbox
+                            current_bbox_group = list(raw_cells[row_idx]) if row_idx < len(raw_cells) else [None]*len(r)
+                        else:
+                            if current_row:
+                                for i_col in range(len(current_row)):
+                                    if i_col < len(r) and str(r[i_col]).strip():
+                                        if str(current_row[i_col]).strip():
+                                            current_row[i_col] = str(current_row[i_col]) + "<br>" + str(r[i_col]).strip()
+                                        else:
+                                            current_row[i_col] = str(r[i_col]).strip()
+
+                                if current_bbox_group and row_idx < len(raw_cells):
+                                    new_row_cells = raw_cells[row_idx]
+                                    for idx, c_box in enumerate(current_bbox_group):
+                                        if idx < len(new_row_cells) and new_row_cells[idx] and isinstance(new_row_cells[idx], tuple):
+                                            if c_box and isinstance(c_box, tuple):
+                                                current_bbox_group[idx] = (
+                                                    min(c_box[0], new_row_cells[idx][0]),
+                                                    min(c_box[1], new_row_cells[idx][1]),
+                                                    max(c_box[2], new_row_cells[idx][2]),
+                                                    max(c_box[3], new_row_cells[idx][3])
+                                                )
+                                            else:
+                                                current_bbox_group[idx] = new_row_cells[idx]
+                            else:
+                                current_row = r
+                                current_bbox_group = list(raw_cells[row_idx]) if row_idx < len(raw_cells) else [None]*len(r)
+
+                    if current_row:
+                        merged_data.append((current_row, current_bbox_group))
+
+                    cleaned_data = []
+                    for row_text, row_boxes in merged_data:
+                        new_row = []
+                        for col_idx in range(min(4, len(row_text))):
+                            if col_idx < 3:
+                                new_row.append(row_text[col_idx].replace('\n', '<br>'))
+                            else:
+                                if row_boxes:
+                                    last_boxes = [b for b in row_boxes[3:] if b and isinstance(b, tuple)]
+                                    if last_boxes:
+                                        min_x = min(b[0] for b in last_boxes)
+                                        min_y = min(b[1] for b in last_boxes)
+                                        max_x = max(b[2] for b in last_boxes)
+                                        max_y = max(b[3] for b in last_boxes)
+                                        cell_bbox = (min_x, min_y, max_x, max_y)
+                                        html_val = format_nested_cell(page, cell_bbox)
+                                        new_row.append(html_val)
+                                    else:
+                                        combined_rules = "<br>".join(str(c) for c in row_text[3:] if str(c).strip())
+                                        new_row.append(combined_rules.replace('\n', '<br>'))
+                                else:
+                                    combined_rules = "<br>".join(str(c) for c in row_text[3:] if str(c).strip())
+                                    new_row.append(combined_rules.replace('\n', '<br>'))
+                        cleaned_data.append(new_row)
+
+                    extracted_tables.append(cleaned_data)
+                    table_info.append((4, len(cleaned_data), False))
+
+                if outer_tables:
+                    first_outer_table = outer_tables[0]
+                    last_outer_table = outer_tables[-1]
                     
                     words_before = [w for w in valid_words if w['bottom'] < first_outer_table.bbox[1]]
                     starts_with_table = (len(words_before) == 0)
@@ -82,17 +181,14 @@ def identify_and_merge_tables(page_metadata):
     
     for i in range(len(page_metadata)):
         page = page_metadata[i]
-        outer_tables = page['outer_tables']
+        outer_tables_data = page['outer_tables']
         
-        if not outer_tables:
+        if not outer_tables_data:
             continue
             
-        for j, table in enumerate(outer_tables):
-            table_data = table.extract()
-            table_data = [["" if cell is None else cell for cell in row] for row in table_data]
-            
+        for j, table_data in enumerate(outer_tables_data):
             is_first_table_on_page = (j == 0)
-            is_last_table_on_page = (j == len(outer_tables) - 1)
+            is_last_table_on_page = (j == len(outer_tables_data) - 1)
             
             if is_first_table_on_page and page['starts_with_table'] and pending_table is not None:
                 if len(table_data) > 0 and len(pending_table) > 0:
@@ -121,7 +217,7 @@ def identify_and_merge_tables(page_metadata):
                             
                             combined = val1
                             if combined and val2_clean:
-                                combined += "\n" + val2_clean
+                                combined += "<br>" + val2_clean
                             elif val2_clean:
                                 combined = val2_clean
                             merged_row.append(combined)
@@ -151,6 +247,19 @@ def identify_and_merge_tables(page_metadata):
         
     return final_tables
 
+def convert_to_markdown(tables):
+    md_output = ""
+    for table in tables:
+        if not table: continue
+        if len(table) > 0:
+            header = table[0]
+            md_output += "| " + " | ".join(str(c).replace("|", "\\|") for c in header) + " |\n"
+            md_output += "| " + " | ".join("---" for _ in header) + " |\n"
+            for row in table[1:]:
+                md_output += "| " + " | ".join(str(c).replace("|", "\\|") for c in row) + " |\n"
+        md_output += "\n"
+    return md_output
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
@@ -160,14 +269,7 @@ if __name__ == "__main__":
         sys.exit(1)
         
     min_top, max_bot = calculate_margins(pdf_path)
-    print(f"Global min table top: {min_top}")
-    print(f"Global max table bottom: {max_bot}")
-    
     metadata = extract_table_metadata(pdf_path, min_top, max_bot)
     merged_tables = identify_and_merge_tables(metadata)
     
-    print(f"\nExtracted {len(merged_tables)} final table(s):")
-    for idx, table in enumerate(merged_tables):
-        print(f"\n--- Table {idx+1} ---")
-        for row in table:
-            print([repr(cell) for cell in row])
+    print(convert_to_markdown(merged_tables))
